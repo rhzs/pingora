@@ -212,7 +212,7 @@ mod tests {
     async fn test_conn_error_addr_not_avail() {
         let peer = HttpPeer::new("127.0.0.1:121".to_string(), false, "".to_string());
         let new_session = connect(&peer, Some("192.0.2.2:0".parse().unwrap())).await;
-        assert_eq!(new_session.unwrap_err().etype(), &InternalError)
+        assert_eq!(new_session.unwrap_err().etype(), &ConnectRefused)
     }
 
     #[tokio::test]
