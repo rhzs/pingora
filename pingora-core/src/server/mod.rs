@@ -14,25 +14,26 @@
 
 //! Server process and configuration management
 
+use std::sync::Arc;
+use std::thread;
+
+use log::{debug, error, info};
+use tokio::signal::unix;
+use tokio::sync::{Mutex, watch};
+use tokio::time::{Duration, sleep};
+
+use configuration::{Opt, ServerConf};
+use daemon::daemonize;
+use pingora_error::{Error, ErrorType, Result};
+use pingora_runtime::Runtime;
+use pingora_timeout::fast_timeout;
+use transfer_fd::Fds;
+
+use crate::services::Service;
+
 pub mod configuration;
 mod daemon;
 pub(crate) mod transfer_fd;
-
-use daemon::daemonize;
-use log::{debug, error, info};
-use pingora_runtime::Runtime;
-use pingora_timeout::fast_timeout;
-use std::sync::Arc;
-use std::thread;
-use tokio::signal::unix;
-use tokio::sync::{watch, Mutex};
-use tokio::time::{sleep, Duration};
-
-use crate::services::Service;
-use configuration::{Opt, ServerConf};
-use transfer_fd::Fds;
-
-use pingora_error::{Error, ErrorType, Result};
 
 /* time to wait before exiting the program
 this is the graceful period for all existing session to finish */
@@ -114,11 +115,10 @@ impl Server {
     async fn graceful_upgrade(&self) {
         // aka: move below to another task and only kick it off here
         info!("SIGQUIT received, sending socks and gracefully exiting");
-        if let Some(fds) = &self.listen_fds {
-            let fds = fds.lock().await;
+        if let Some(result) = self.send_fds().await {
             info!("Trying to send socks");
             // XXX: this is blocking IO
-            match fds.send_to_sock(self.configuration.as_ref().upgrade_sock.as_str()) {
+            match result {
                 Ok(_) => {
                     info!("listener sockets sent");
                 }
@@ -163,6 +163,19 @@ impl Server {
             info!("service exited.")
         });
         service_runtime
+    }
+
+    /// Send all listening sockets to new server.
+    ///
+    /// When trying to zero downtime upgrade as a new server from older which is already
+    /// running, this function will try to send all its listening sockets to the new one.
+    pub async fn send_fds(&self) -> Option<Result<usize, nix::Error>> {
+        if let Some(fds) = &self.listen_fds {
+            let fds = fds.lock().await;
+            info!("Trying to send socks");
+            return Some(fds.send_to_sock(self.configuration.as_ref().upgrade_sock.as_str()));
+        }
+        None
     }
 
     fn load_fds(&mut self, upgrade: bool) -> Result<(), nix::Error> {
@@ -263,6 +276,27 @@ impl Server {
         }
     }
 
+    /// Run all services of server
+    ///
+    /// This function will run all services of server.
+    pub fn run_services(&mut self) -> Vec<Runtime> {
+        let conf = self.configuration.as_ref();
+        let mut runtimes: Vec<Runtime> = Vec::new();
+
+        while let Some(service) = self.services.pop() {
+            let threads = service.threads().unwrap_or(conf.threads);
+            let runtime = Server::run_service(
+                service,
+                self.listen_fds.clone(),
+                self.shutdown_recv.clone(),
+                threads,
+                conf.work_stealing,
+            );
+            runtimes.push(runtime);
+        }
+        runtimes
+    }
+
     /// Start the server
     ///
     /// This function will block forever until the server needs to quit. So this would be the last
@@ -289,19 +323,7 @@ impl Server {
             None => None,
         };
 
-        let mut runtimes: Vec<Runtime> = Vec::new();
-
-        while let Some(service) = self.services.pop() {
-            let threads = service.threads().unwrap_or(conf.threads);
-            let runtime = Server::run_service(
-                service,
-                self.listen_fds.clone(),
-                self.shutdown_recv.clone(),
-                threads,
-                conf.work_stealing,
-            );
-            runtimes.push(runtime);
-        }
+        let runtimes = self.run_services();
 
         // blocked on main loop so that it runs forever
         // Only work steal runtime can use block_on()
