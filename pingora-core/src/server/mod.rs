@@ -19,7 +19,7 @@ mod daemon;
 pub(crate) mod transfer_fd;
 
 use daemon::daemonize;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use pingora_runtime::Runtime;
 use pingora_timeout::fast_timeout;
 use std::sync::Arc;
@@ -30,15 +30,15 @@ use tokio::time::{sleep, Duration};
 
 use crate::services::Service;
 use configuration::{Opt, ServerConf};
-pub use transfer_fd::Fds;
+use transfer_fd::Fds;
 
 use pingora_error::{Error, ErrorType, Result};
 
-/* Time to wait before exiting the program.
-This is the graceful period for all existing sessions to finish */
+/* time to wait before exiting the program
+this is the graceful period for all existing session to finish */
 const EXIT_TIMEOUT: u64 = 60 * 5;
-/* Time to wait before shutting down listening sockets.
-This is the graceful period for the new service to get ready */
+/* time to wait before shutting down listening sockets
+this is the graceful period for the new service to get ready */
 const CLOSE_TIMEOUT: u64 = 5;
 
 enum ShutdownType {
@@ -49,7 +49,7 @@ enum ShutdownType {
 /// The receiver for server's shutdown event. The value will turn to true once the server starts
 /// to shutdown
 pub type ShutdownWatch = watch::Receiver<bool>;
-pub type ListenFds = Arc<Mutex<Fds>>;
+pub(crate) type ListenFds = Arc<Mutex<Fds>>;
 
 /// The server object
 ///
@@ -77,22 +77,21 @@ pub struct Server {
 impl Server {
     async fn main_loop(&self) -> ShutdownType {
         // waiting for exit signal
-        // TODO: there should be a signal handling function
-        let mut graceful_upgrade_signal = unix::signal(unix::SignalKind::quit()).unwrap();
-        let mut graceful_terminate_signal = unix::signal(unix::SignalKind::terminate()).unwrap();
-        let mut fast_shutdown_signal = unix::signal(unix::SignalKind::interrupt()).unwrap();
-        tokio::select! {
-            _ = fast_shutdown_signal.recv() => {
+        let shutdown_signal = wait_for_shutdown_signal().await;
+        match shutdown_signal {
+            ShutdownSignal::Fast => {
                 info!("SIGINT received, exiting");
                 ShutdownType::Quick
-            },
-            _ = graceful_terminate_signal.recv() => {
+            }
+            ShutdownSignal::GracefulTerminate => {
                 // we receive a graceful terminate, all instances are instructed to stop
                 info!("SIGTERM received, gracefully exiting");
                 // graceful shutdown if there are listening sockets
                 info!("Broadcasting graceful shutdown");
                 match self.shutdown_watch.send(true) {
-                    Ok(_) => { info!("Graceful shutdown started!"); }
+                    Ok(_) => {
+                        info!("Graceful shutdown started!");
+                    }
                     Err(e) => {
                         error!("Graceful shutdown broadcast failed: {e}");
                     }
@@ -100,43 +99,51 @@ impl Server {
                 info!("Broadcast graceful shutdown complete");
                 ShutdownType::Graceful
             }
-            _ = graceful_upgrade_signal.recv() => {
-                // TODO: still need to select! on signals in case a fast shutdown is needed
-                // aka: move below to another task and only kick it off here
-                info!("SIGQUIT received, sending socks and gracefully exiting");
-                if let Some(fds) = &self.listen_fds {
-                    let fds = fds.lock().await;
-                    info!("Trying to send socks");
-                    // XXX: this is blocking IO
-                    match fds.send_to_sock(
-                        self.configuration.as_ref().upgrade_sock.as_str())
-                    {
-                        Ok(_) => {info!("listener sockets sent");},
-                        Err(e) => {
-                            error!("Unable to send listener sockets to new process: {e}");
-                            // sentry log error on fd send failure
-                            #[cfg(not(debug_assertions))]
-                            sentry::capture_error(&e);
-                        }
-                    }
-                    sleep(Duration::from_secs(CLOSE_TIMEOUT)).await;
-                    info!("Broadcasting graceful shutdown");
-                    // gracefully exiting
-                    match self.shutdown_watch.send(true) {
-                        Ok(_) => { info!("Graceful shutdown started!"); }
-                        Err(e) => {
-                            error!("Graceful shutdown broadcast failed: {e}");
-                            // switch to fast shutdown
-                            return ShutdownType::Graceful;
-                        }
-                    }
-                    info!("Broadcast graceful shutdown complete");
-                    ShutdownType::Graceful
-                } else {
-                    info!("No socks to send, shutting down.");
-                    ShutdownType::Graceful
+            ShutdownSignal::GracefulUpgrade => {
+                let mut wait_for_sig_int = unix::signal(unix::SignalKind::interrupt())
+                    .expect("Failed to create SIGINT listener.");
+                tokio::select! {
+                    _ = wait_for_sig_int.recv() => {}
+                    _ = self.graceful_upgrade() => {}
                 }
-            },
+                ShutdownType::Graceful
+            }
+        }
+    }
+
+    async fn graceful_upgrade(&self) {
+        // aka: move below to another task and only kick it off here
+        info!("SIGQUIT received, sending socks and gracefully exiting");
+        if let Some(fds) = &self.listen_fds {
+            let fds = fds.lock().await;
+            info!("Trying to send socks");
+            // XXX: this is blocking IO
+            match fds.send_to_sock(self.configuration.as_ref().upgrade_sock.as_str()) {
+                Ok(_) => {
+                    info!("listener sockets sent");
+                }
+                Err(e) => {
+                    error!("Unable to send listener sockets to new process: {e}");
+                    // sentry log error on fd send failure
+                    #[cfg(not(debug_assertions))]
+                    sentry::capture_error(&e);
+                }
+            }
+            sleep(Duration::from_secs(CLOSE_TIMEOUT)).await;
+            info!("Broadcasting graceful shutdown");
+            // gracefully exiting
+            match self.shutdown_watch.send(true) {
+                Ok(_) => {
+                    info!("Graceful shutdown started!");
+                }
+                Err(e) => {
+                    error!("Graceful shutdown broadcast failed: {e}");
+                    // switch to fast shutdown
+                }
+            }
+            info!("Broadcast graceful shutdown complete");
+        } else {
+            info!("No socks to send, shutting down.");
         }
     }
 
@@ -148,7 +155,7 @@ impl Server {
         work_stealing: bool,
     ) -> Runtime
 // NOTE: we need to keep the runtime outside async since
-        // otherwise the runtime will be dropped.
+    // otherwise the runtime will be dropped.
     {
         let service_runtime = Server::create_runtime(service.name(), threads, work_stealing);
         service_runtime.get_handle().spawn(async move {
@@ -166,32 +173,6 @@ impl Server {
         }
         self.listen_fds = Some(Arc::new(Mutex::new(fds)));
         Ok(())
-    }
-
-    /// Create a new [`Server`], using the [`Opt`] and [`ServerConf`] values provided
-    ///
-    /// This method is intended for pingora frontends that are NOT using the built-in
-    /// command line and configuration file parsing, and are instead using their own.
-    ///
-    /// If a configuration file path is provided as part of `opt`, it will be ignored
-    /// and a warning will be logged.
-    pub fn new_with_opt_and_conf(opt: Opt, mut conf: ServerConf) -> Server {
-        if let Some(c) = opt.conf.as_ref() {
-            warn!("Ignoring command line argument using '{c}' as configuration, and using provided configuration instead.");
-        }
-        conf.merge_with_opt(&opt);
-
-        let (tx, rx) = watch::channel(false);
-
-        Server {
-            services: vec![],
-            listen_fds: None,
-            shutdown_watch: tx,
-            shutdown_recv: rx,
-            configuration: Arc::new(conf),
-            options: Some(opt),
-            sentry: None,
-        }
     }
 
     /// Create a new [`Server`].
@@ -256,7 +237,7 @@ impl Server {
 
         /* only init sentry in release builds */
         #[cfg(not(debug_assertions))]
-        let _guard = match self.sentry.as_ref() {
+            let _guard = match self.sentry.as_ref() {
             Some(uri) => Some(sentry::init(uri.as_str())),
             None => None,
         };
@@ -303,7 +284,7 @@ impl Server {
 
         /* only init sentry in release builds */
         #[cfg(not(debug_assertions))]
-        let _guard = match self.sentry.as_ref() {
+            let _guard = match self.sentry.as_ref() {
             Some(uri) => Some(sentry::init(uri.as_str())),
             None => None,
         };
@@ -328,25 +309,15 @@ impl Server {
         let shutdown_type = server_runtime.get_handle().block_on(self.main_loop());
 
         if matches!(shutdown_type, ShutdownType::Graceful) {
-            let exit_timeout = self
-                .configuration
-                .as_ref()
-                .grace_period_seconds
-                .unwrap_or(EXIT_TIMEOUT);
-            info!("Graceful shutdown: grace period {}s starts", exit_timeout);
-            thread::sleep(Duration::from_secs(exit_timeout));
+            info!("Graceful shutdown: grace period {}s starts", EXIT_TIMEOUT);
+            thread::sleep(Duration::from_secs(EXIT_TIMEOUT));
             info!("Graceful shutdown: grace period ends");
         }
 
         // Give tokio runtimes time to exit
         let shutdown_timeout = match shutdown_type {
             ShutdownType::Quick => Duration::from_secs(0),
-            ShutdownType::Graceful => Duration::from_secs(
-                self.configuration
-                    .as_ref()
-                    .graceful_shutdown_timeout_seconds
-                    .unwrap_or(5),
-            ),
+            ShutdownType::Graceful => Duration::from_secs(5),
         };
         let shutdowns: Vec<_> = runtimes
             .into_iter()
@@ -373,5 +344,47 @@ impl Server {
         } else {
             Runtime::new_no_steal(threads, name)
         }
+    }
+}
+
+enum ShutdownSignal {
+    Fast,
+    GracefulTerminate,
+    GracefulUpgrade,
+}
+
+async fn wait_for_shutdown_signal() -> ShutdownSignal {
+    let sig_int = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to create SIGINT listener.");
+    };
+
+    #[cfg(unix)]
+        let sig_term = async {
+        unix::signal(unix::SignalKind::terminate())
+            .expect("Failed to create SIGTERM listener.")
+            .recv()
+            .await;
+    };
+
+    #[cfg(unix)]
+        let sig_quit = async {
+        unix::signal(unix::SignalKind::quit())
+            .expect("Failed to create SIGQUIT listener.")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+        let sig_term = std::future::pending::<()>();
+
+    #[cfg(not(unix))]
+        let sig_quit = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = sig_int => ShutdownSignal::Fast,
+        _ = sig_term => ShutdownSignal::GracefulTerminate,
+        _ = sig_quit => ShutdownSignal::GracefulUpgrade,
     }
 }
